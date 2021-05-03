@@ -14,6 +14,8 @@
 #define POINTERS_PER_INODE 5
 #define POINTERS_PER_BLOCK 1024
 
+int fs_mounted = 0;
+
 struct fs_superblock
 {
     int magic;
@@ -88,9 +90,36 @@ void print_inode(struct fs_inode *current_inode, int inode_block, int block_offs
     }
 }
 
-int fs_format()
-{
-    return 0;
+int set_inode_blocks() {
+    int inode_blocks;
+    
+    // Ensure that at least ten percent of the blocks are reserved for inodes
+    if (disk_size() % 10 == 0) {
+        inode_blocks = disk_size() / 10;
+    }
+    else {
+        inode_blocks = (disk_size() / 10) + 1;
+    }
+
+    return inode_blocks;
+}
+
+void destroy_data(int inode_blocks) {  
+    union fs_block block;
+    
+    for (int i = 1; i <= inode_blocks; i++) {
+        // Read inode block
+        disk_read(i, block.data);
+
+        // Traverse each inode in the inode block
+        for (int j = 0; j < INODES_PER_BLOCK; j++) {
+            // Make each inode invalid
+            block.inode[j].isvalid = 0;
+        }
+
+        // Write the destroyed inode block back to the filesystem
+        disk_write(i, block.data);
+    }
 }
 
 void fs_debug()
@@ -117,6 +146,30 @@ void fs_debug()
             }
         }
     }
+}
+
+int fs_format()
+{
+    // If filesystem is already mounted, return an error
+    if (fs_mounted) {
+        return 0;
+    }
+
+    // Create new filesystem block
+    union fs_block block;
+
+    // Create each element of the super block
+    block.super.magic = FS_MAGIC;
+    block.super.nblocks = disk_size();
+    block.super.ninodeblocks = set_inode_blocks();
+    block.super.ninodes = block.super.ninodeblocks * INODES_PER_BLOCK;
+
+    // Destroy any existing data in the filesystem
+    destroy_data(block.super.ninodeblocks);
+    disk_write(0, block.data);
+
+    // Created successfully
+    return 1;
 }
 
 int fs_mount()
