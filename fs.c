@@ -44,7 +44,6 @@ union fs_block
 
 void create_new_bitmap()
 {
-    // Set up the main block and indirect block
     union fs_block block;
     union fs_block indirect_block;
 
@@ -214,7 +213,6 @@ void destroy_data(int inode_blocks)
 void fs_debug()
 {
     union fs_block block;
-
     disk_read(0, block.data);
 
     printf("superblock:\n");
@@ -248,7 +246,6 @@ int fs_format()
         return 0;
     }
 
-    // Create new filesystem block
     union fs_block block;
 
     // Create each element of the super block
@@ -267,7 +264,6 @@ int fs_format()
 
 int fs_mount()
 {
-    // Create new filesystem block and read info
     union fs_block block;
     disk_read(0, block.data);
 
@@ -309,6 +305,27 @@ int fs_delete(int inumber)
 
 int fs_getsize(int inumber)
 {
+    union fs_block block;
+    disk_read(0, block.data);
+
+    // Find correct inode block
+    int index = (inumber + INODES_PER_BLOCK) / INODES_PER_BLOCK;
+
+    // Check if inode block is in limits
+    if (index > block.super.ninodeblocks || index <= 0) {
+        return -1;
+    }
+
+    // Read inode from inode block
+    disk_read(index, block.data);
+    struct fs_inode inode = block.inode[inumber % INODES_PER_BLOCK];
+
+    // Check if valid inode, return size if so
+    if (inode.isvalid) {
+        return inode.size;
+    }
+
+    // Inode was invalid and return error
     return -1;
 }
 
