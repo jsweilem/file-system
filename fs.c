@@ -44,7 +44,9 @@ union fs_block
 
 void create_new_bitmap()
 {
+
     union fs_block block;
+
     union fs_block indirect_block;
 
     // Begin processing of the new bitmap
@@ -295,12 +297,102 @@ int fs_mount()
 
 int fs_create()
 {
-    return 0;
+
+    union fs_block block;
+    disk_read(0, block.data);
+
+    int free_inode = 0;
+
+    for (int k = 1; k <= block.super.ninodeblocks; k++)
+    {
+        // Read inode block
+        disk_read(k, block.data);
+
+        // Traverse each inode in the inode block
+        for (int j = 1; j < INODES_PER_BLOCK; j++)
+        {
+            // If inode is invalid. insert valid inode
+            if (!block.inode[j].isvalid)
+            {
+                free_inode = (k - 1) * INODES_PER_BLOCK + j;
+
+                struct fs_inode inode;
+
+                inode.isvalid = 1;
+
+                inode.size = 0; // size??
+
+                for (int i; i < POINTERS_PER_INODE; i++)
+                {
+                    inode.direct[i] = 0;
+                }
+
+                inode.indirect = 0;
+
+                block.inode[j] = inode;
+
+                disk_write(k, block.data);
+                break;
+            }
+        }
+    }
+    return free_inode;
 }
 
 int fs_delete(int inumber)
 {
-    return 0;
+    union fs_block super_block;
+
+    disk_read(0, super_block.data);
+
+    if (inumber > super_block.super.ninodes || inumber <= 0)
+    {
+        return 0;
+    }
+
+    union fs_block block;
+    // Read inode block
+    disk_read(((inumber / INODES_PER_BLOCK) + 1), block.data);
+
+    // if inode doesn't exist, return 0
+    if (!block.inode[inumber % INODES_PER_BLOCK].isvalid)
+    {
+        return 0;
+    }
+
+    // for each direct block mapping, if it has a value, free it
+    for (int i = 0; i < POINTERS_PER_INODE; i++)
+    {
+
+        if (block.inode[inumber % INODES_PER_BLOCK].direct[i])
+        {
+            bitmap[block.inode[inumber % INODES_PER_BLOCK].direct[i]] = 1;
+            block.inode[inumber % INODES_PER_BLOCK].direct[i] = 0;
+        }
+    }
+    // if there is an indirect block mapping, free it
+    if (block.inode[inumber % INODES_PER_BLOCK].indirect)
+    {
+        union fs_block indirect_block;
+        disk_read(block.inode[inumber % INODES_PER_BLOCK].indirect, indirect_block.data);
+
+        for (int i = 0; i < POINTERS_PER_INODE; i++)
+        {
+            if (indirect_block.inode[inumber % INODES_PER_BLOCK].direct[i])
+            {
+                bitmap[indirect_block.inode[inumber % INODES_PER_BLOCK].direct[i]] = 1;
+                indirect_block.inode[inumber % INODES_PER_BLOCK].direct[i] = 0;
+            }
+        }
+        disk_write(block.inode[inumber % INODES_PER_BLOCK].indirect, indirect_block.data);
+    }
+
+    // set valid bit to 0
+    block.inode[inumber % INODES_PER_BLOCK].isvalid = 0;
+    // write
+    disk_write(((inumber / INODES_PER_BLOCK) + 1), block.data);
+
+    return 1;
 }
 
 int fs_getsize(int inumber)
@@ -308,11 +400,17 @@ int fs_getsize(int inumber)
     union fs_block block;
     disk_read(0, block.data);
 
+    // Check if inumber is 0, which is an invalid inumber.
+    if (inumber <= 0)
+    {
+        return -1;
+    }
     // Find correct inode block
     int index = (inumber + INODES_PER_BLOCK) / INODES_PER_BLOCK;
 
     // Check if inode block is in limits
-    if (index > block.super.ninodeblocks || index <= 0) {
+    if (index > block.super.ninodeblocks)
+    {
         return -1;
     }
 
@@ -320,8 +418,9 @@ int fs_getsize(int inumber)
     disk_read(index, block.data);
     struct fs_inode inode = block.inode[inumber % INODES_PER_BLOCK];
 
-    // Check if valid inode, return size if so
-    if (inode.isvalid) {
+    // Check if valid inode; if inode is valid, return the size
+    if (inode.isvalid)
+    {
         return inode.size;
     }
 
