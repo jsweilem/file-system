@@ -42,6 +42,23 @@ union fs_block
     char data[DISK_BLOCK_SIZE];
 };
 
+int allocate_direct_block()
+{
+    union fs_block direct_block;
+    disk_read(0, direct_block.data);
+    int block;
+    for (int i = 0; i < direct_block.super.nblocks; i++)
+    {
+        if (bitmap[i])
+        {
+            bitmap[i] = 0;
+            block = i;
+            break;
+        }
+    }
+
+    return block;
+}
 void create_new_bitmap()
 {
 
@@ -430,10 +447,278 @@ int fs_getsize(int inumber)
 
 int fs_read(int inumber, char *data, int length, int offset)
 {
-    return 0;
+    union fs_block super_block;
+    // allocate data array and add 1 char for null terminator
+    data = (char *)malloc((length) * sizeof(char));
+    data[0] = '\0';
+    // allocate temp data to copy data to main pointer
+    char *temp_data;
+
+    temp_data = (char *)malloc((DISK_BLOCK_SIZE + 1) * sizeof(char));
+    if (!temp_data)
+    {
+        free(data);
+        return 0;
+    }
+
+    if (!data)
+    {
+        return 0;
+    }
+
+    disk_read(0, super_block.data);
+
+    if (inumber > super_block.super.ninodes || inumber <= 0)
+    {
+        return 0;
+    }
+
+    if (offset < 0)
+    {
+        return 0;
+    }
+    union fs_block inode_block;
+    union fs_block indirect_block;
+
+    // Read inode block
+    disk_read(((inumber / INODES_PER_BLOCK) + 1), inode_block.data);
+
+    int start_block = offset / DISK_BLOCK_SIZE;
+
+    // Check to see if indirect block will be used, if so read it in
+    if ((length + offset) / DISK_BLOCK_SIZE > POINTERS_PER_INODE)
+    {
+        if (inode_block.inode->indirect == 0)
+        {
+            return 0;
+        }
+
+        disk_read(inode_block.inode->indirect, indirect_block.data);
+    }
+
+    int bytes_read = 0;
+
+    for (int i = start_block; bytes_read < length; i++)
+    {
+        // Determine which block to read from
+        int curr_block;
+        if (i < POINTERS_PER_INODE)
+        {
+            curr_block = inode_block.inode[inumber % INODES_PER_BLOCK].direct[i];
+        }
+        else
+        {
+            // if there are no more indrect blocks to read, return number of
+            if (i - POINTERS_PER_BLOCK >= 1024)
+            {
+                return bytes_read;
+            }
+            curr_block = indirect_block.pointers[i - POINTERS_PER_BLOCK];
+        }
+
+        union fs_block read_block;
+        // grab block
+        disk_read(curr_block, read_block.data);
+        int read_offset = 0;
+        int read_length;
+
+        if (curr_block == 0)
+        {
+            return bytes_read;
+        }
+        // if at beginning of file, start at offset, read until the end of the block
+        if (bytes_read == 0)
+        {
+            read_offset = offset % DISK_BLOCK_SIZE;
+            if (DISK_BLOCK_SIZE - offset > length)
+            {
+                read_length = length;
+            }
+            else
+            {
+                read_length = DISK_BLOCK_SIZE - offset;
+            }
+
+            // copy file contents to string
+            for (int j = 0; j < read_length; j++)
+            {
+                temp_data[j] = read_block.data[j + read_offset];
+            }
+
+            // update number of bytes read
+            temp_data[read_length] = '\0';
+            bytes_read += read_length;
+            strcat(data, temp_data);
+        }
+        else
+        {
+            // if the block is not the first block and in last block, read what is left else read the entire block
+
+            if ((length - bytes_read) < DISK_BLOCK_SIZE || (bytes_read + DISK_BLOCK_SIZE == length))
+            {
+                read_length = length - bytes_read;
+
+                // copy file contents to string
+                for (int j = 0; j < read_length; j++)
+                {
+                    data[length - read_length - 1] = read_block.data[j];
+                }
+
+                bytes_read += read_length;
+            }
+            else
+            {
+                read_length = DISK_BLOCK_SIZE;
+
+                // copy file contents to string
+                for (int j = 0; j < read_length; j++)
+                {
+                    temp_data[j] = read_block.data[j];
+                }
+
+                temp_data[read_length] = '\0';
+                bytes_read += read_length;
+
+                strcat(data, temp_data);
+            }
+        }
+    }
+    return bytes_read;
 }
 
 int fs_write(int inumber, const char *data, int length, int offset)
 {
-    return 0;
+
+    union fs_block super_block;
+    // allocate data array and add 1 char for null terminator
+    data = (char *)malloc((length) * sizeof(char));
+
+    if (!data)
+    {
+        return 0;
+    }
+    // allocate temp data to copy data to main pointer
+    char *temp_data;
+
+    temp_data = (char *)malloc((DISK_BLOCK_SIZE + 1) * sizeof(char));
+    if (!temp_data)
+    {
+        return 0;
+    }
+    disk_read(0, super_block.data);
+
+    if (inumber > super_block.super.ninodes || inumber <= 0)
+    {
+        return 0;
+    }
+
+    if (offset < 0)
+    {
+        return 0;
+    }
+    union fs_block inode_block;
+    union fs_block indirect_block;
+
+    int start_block = offset / DISK_BLOCK_SIZE;
+
+    // Check to see if indirect block will be used, if so read it in
+    if ((length + offset) / DISK_BLOCK_SIZE > POINTERS_PER_INODE)
+    {
+        if (inode_block.inode->indirect == 0)
+        {
+            return 0;
+        }
+
+        disk_read(inode_block.inode->indirect, indirect_block.data);
+    }
+
+    int bytes_written = 0;
+
+    for (int i = start_block; bytes_written < length; i++)
+    {
+
+        int curr_block;
+        if (i < POINTERS_PER_INODE)
+        {
+            curr_block = inode_block.inode[inumber % INODES_PER_BLOCK].direct[i];
+
+            if (!curr_block)
+            {
+                curr_block = allocate_direct_block();
+                inode_block.inode[inumber % INODES_PER_BLOCK].direct[i] = curr_block;
+            }
+        }
+        else
+        {
+            // if there are no more indrect blocks to write, return number of bytes written
+            if (i - POINTERS_PER_BLOCK >= 1024)
+            {
+                return bytes_written;
+            }
+            curr_block = indirect_block.pointers[i - POINTERS_PER_BLOCK];
+
+            // if block needs to be allocated, allocate it
+            if (!curr_block)
+            {
+                curr_block = allocate_direct_block();
+                indirect_block.pointers[i - POINTERS_PER_BLOCK] = curr_block;
+            }
+        }
+
+        int write_offset;
+        int write_length;
+        // if at beginning of file, start at offset, read until the end of the block
+        if (bytes_written == 0)
+        {
+            write_offset = offset % DISK_BLOCK_SIZE;
+            if (DISK_BLOCK_SIZE - offset > length)
+            {
+                write_length = length;
+            }
+            else
+            {
+                write_length = DISK_BLOCK_SIZE - offset;
+            }
+
+            for (int j = 0; j < write_length; j++)
+            {
+                temp_data[j] = data[j + write_offset];
+            }
+            // update number of bytes read
+            bytes_written += write_length;
+
+            disk_write(curr_block, temp_data);
+        }
+        else
+        {
+            // if the block is not the first block and in last block, read what is left else read the entire block
+
+            if ((length - bytes_written) < DISK_BLOCK_SIZE || (bytes_written + DISK_BLOCK_SIZE == length))
+            {
+                write_length = length - bytes_written;
+
+                // copy file contents to string
+                for (int j = 0; j < write_length; j++)
+                {
+                    temp_data[j] = data[bytes_written + j];
+                }
+
+                bytes_written += write_length;
+            }
+            else
+            {
+                write_length = DISK_BLOCK_SIZE;
+
+                // copy file contents to string
+                for (int j = 0; j < write_length; j++)
+                {
+                    temp_data[j] = data[bytes_written + j];
+                }
+
+                bytes_written += write_length;
+            }
+        }
+    }
+
+    return bytes_written;
 }
