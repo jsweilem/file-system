@@ -16,7 +16,7 @@
 
 int fs_mounted = 0;
 int *bitmap;
-int new_blocks;
+int num_inode_blocks;
 
 struct fs_superblock
 {
@@ -55,7 +55,8 @@ int allocate_new_block(int blocks)
 
     return 0;
 }
-void create_new_bitmap()
+
+int create_new_bitmap()
 {
 
     union fs_block block;
@@ -68,7 +69,7 @@ void create_new_bitmap()
         // Read info for new filesystem
         disk_read(i, block.data);
 
-        if (!i)
+        if (i == 0)
         { // Check if superblock and set it
             if (block.super.magic == FS_MAGIC)
             {
@@ -76,22 +77,21 @@ void create_new_bitmap()
             }
             else
             {
-                bitmap[0] = 0;
+                return -1;
             }
         }
-        else if (i <= new_blocks)
-        { // Set up inode blocks
-            // Check for validity of inode
-            int valid = 0;
+        // set inode blocks as valid and set the data blocks that
+        // they point to as valid
+        else if (i <= num_inode_blocks)
+        {
+            bitmap[i] = 1;
 
-            // Go through each inode to check for bitmap
+            // Go through each inode in the inode block
             for (int j = 0; j < INODES_PER_BLOCK; j++)
             {
-                // Check if the whole block is valid
+                // Check if the inode is valid
                 if (block.inode[j].isvalid)
                 {
-                    bitmap[i] = 1;
-                    valid = 1;
 
                     // Check the direct pointers
                     for (int k = 0; k < POINTERS_PER_INODE; k++)
@@ -108,6 +108,8 @@ void create_new_bitmap()
                         // Read the indirect pointer and check the indirect block
                         disk_read(block.inode[j].indirect, indirect_block.data);
 
+                        bitmap[block.inode[j].indirect] = 1;
+
                         // Check pointers on indirect block
                         for (int l = 0; l < POINTERS_PER_BLOCK; l++)
                         {
@@ -119,14 +121,10 @@ void create_new_bitmap()
                     }
                 }
             }
-
-            // If whole block is not valid, mark it as invalid
-            if (!valid)
-            {
-                bitmap[i] = 0;
-            }
         }
     }
+
+    return 1;
 }
 
 void print_inode(struct fs_inode *current_inode, int inode_block, int block_offset)
@@ -298,11 +296,14 @@ int fs_mount()
     }
 
     // Set new values for the system and mark as mounted
-    new_blocks = block.super.ninodeblocks;
+    num_inode_blocks = block.super.ninodeblocks;
     fs_mounted = 1;
 
     // Creates new free block bitmap
-    create_new_bitmap();
+    int rc = create_new_bitmap();
+    if (rc == -1) { 
+        return 0;
+    }
 
     // Mounted successfully
     return 1;
@@ -311,7 +312,7 @@ int fs_mount()
 int fs_create()
 {
     // Check to see if a disk is mounted
-    if (bitmap == NULL)
+    if (!fs_mounted)
     {
         return 0;
     }
@@ -323,11 +324,6 @@ int fs_create()
 
     for (int k = 1; k <= block.super.ninodeblocks; k++)
     {
-        // Set inode block to valid when creating
-        if (bitmap[k] == 0) {
-            bitmap[k] == 1;
-        }
-
         // Read inode block
         disk_read(k, block.data);
         struct fs_inode inode;
@@ -351,11 +347,7 @@ int fs_create()
                     inode.direct[i] = 0;
                 }
                 
-                //memset(inode.direct, 0, sizeof(inode.direct));
-                
                 inode.indirect = 0;
-
-                //bitmap[j] = 1;
 
                 block.inode[j] = inode;
 
@@ -399,29 +391,37 @@ int fs_delete(int inumber)
 
         if (block.inode[inumber % INODES_PER_BLOCK].direct[i])
         {
-            bitmap[block.inode[inumber % INODES_PER_BLOCK].direct[i]] = 1;
+            // set the bitmap entry for the pointed-to block to 0
+            bitmap[block.inode[inumber % INODES_PER_BLOCK].direct[i]] = 0;
+            // set the pointer to 0
             block.inode[inumber % INODES_PER_BLOCK].direct[i] = 0;
         }
     }
-    // if there is an indirect block mapping, free it
+    // if there is an indirect block mapping, free the data blocks mapped from the indirect block
+
     if (block.inode[inumber % INODES_PER_BLOCK].indirect)
     {
         union fs_block indirect_block;
         disk_read(block.inode[inumber % INODES_PER_BLOCK].indirect, indirect_block.data);
 
-        for (int i = 0; i < POINTERS_PER_INODE; i++)
+        for (int i = 0; i < POINTERS_PER_BLOCK; i++)
         {
-            if (indirect_block.inode[inumber % INODES_PER_BLOCK].direct[i])
+            if (indirect_block.pointers[i]);
             {
-                bitmap[indirect_block.inode[inumber % INODES_PER_BLOCK].direct[i]] = 1;
-                indirect_block.inode[inumber % INODES_PER_BLOCK].direct[i] = 0;
+                // set the bitmap entry for the pointed-to block to 0
+                bitmap[indirect_block.pointers[i]] = 0;
+                // set the pointer to 0
+                indirect_block.pointers[i] = 0;
             }
         }
         disk_write(block.inode[inumber % INODES_PER_BLOCK].indirect, indirect_block.data);
     }
+    // set the indirect pointer to zero
+    block.inode[inumber % INODES_PER_BLOCK].indirect = 0;
 
     // set valid bit to 0
     block.inode[inumber % INODES_PER_BLOCK].isvalid = 0;
+    block.inode[inumber % INODES_PER_BLOCK].size = 0;
     // write
     disk_write(((inumber / INODES_PER_BLOCK) + 1), block.data);
 
@@ -687,13 +687,13 @@ int fs_write(int inumber, const char *data, int length, int offset)
         disk_write(block.inode[inode_offset].direct[i], total_data);
 
         // Write a piece of data and copy it. Recalculate how much has been read
-        if ((bytes_left - bytes_written) < 4096)
+        if ((bytes_left - bytes_written) < DISK_BLOCK_SIZE)
         {
             bytes_written += bytes_left - bytes_written;
         }
         else
         {
-            bytes_written += 4096;
+            bytes_written += DISK_BLOCK_SIZE;
         }
 
         strcpy(total_data, &data[bytes_written]);
@@ -744,13 +744,13 @@ int fs_write(int inumber, const char *data, int length, int offset)
         disk_write(indirect_block.pointers[j], total_data);
 
         // Write a piece of data and copy it. Recalculate how much has been read
-        if ((bytes_left - bytes_written) < 4096)
+        if ((bytes_left - bytes_written) < DISK_BLOCK_SIZE)
         {
             bytes_written += bytes_left - bytes_written;
         }
         else
         {
-            bytes_written += 4096;
+            bytes_written += DISK_BLOCK_SIZE;
         }
 
         strcpy(total_data, &data[bytes_written]);
