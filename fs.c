@@ -42,22 +42,18 @@ union fs_block
     char data[DISK_BLOCK_SIZE];
 };
 
-int allocate_direct_block()
+int allocate_new_block(int blocks)
 {
-    union fs_block direct_block;
-    disk_read(0, direct_block.data);
-    int block;
-    for (int i = 0; i < direct_block.super.nblocks; i++)
+    for (int i = 0; i < blocks; i++)
     {
-        if (bitmap[i])
+        if (!bitmap[i])
         {
-            bitmap[i] = 0;
-            block = i;
-            break;
+            bitmap[i] = 1;
+            return i;
         }
     }
 
-    return block;
+    return 0;
 }
 void create_new_bitmap()
 {
@@ -91,7 +87,7 @@ void create_new_bitmap()
             // Go through each inode to check for bitmap
             for (int j = 0; j < INODES_PER_BLOCK; j++)
             {
-                // Check if the who;e block is valid
+                // Check if the whole block is valid
                 if (block.inode[j].isvalid)
                 {
                     bitmap[i] = 1;
@@ -314,6 +310,11 @@ int fs_mount()
 
 int fs_create()
 {
+    // Check to see if a disk is mounted
+    if (bitmap == NULL)
+    {
+        return 0;
+    }
 
     union fs_block block;
     disk_read(0, block.data);
@@ -322,29 +323,39 @@ int fs_create()
 
     for (int k = 1; k <= block.super.ninodeblocks; k++)
     {
+        // Set inode block to valid when creating
+        if (bitmap[k] == 0) {
+            bitmap[k] == 1;
+        }
+
         // Read inode block
         disk_read(k, block.data);
+        struct fs_inode inode;
 
         // Traverse each inode in the inode block
         for (int j = 1; j < INODES_PER_BLOCK; j++)
         {
+            inode = block.inode[j];
+
             // If inode is invalid. insert valid inode
-            if (!block.inode[j].isvalid)
+            if (!inode.isvalid)
             {
                 free_inode = (k - 1) * INODES_PER_BLOCK + j;
 
-                struct fs_inode inode;
-
                 inode.isvalid = 1;
+                inode.size = 0;
 
-                inode.size = 0; // size??
-
+                // Setting direct pointers to 0
                 for (int i; i < POINTERS_PER_INODE; i++)
                 {
                     inode.direct[i] = 0;
                 }
-
+                
+                //memset(inode.direct, 0, sizeof(inode.direct));
+                
                 inode.indirect = 0;
+
+                //bitmap[j] = 1;
 
                 block.inode[j] = inode;
 
@@ -358,8 +369,13 @@ int fs_create()
 
 int fs_delete(int inumber)
 {
-    union fs_block super_block;
+    // Check to see if a disk is mounted
+    if (!fs_mounted)
+    {
+        return 0;
+    }
 
+    union fs_block super_block;
     disk_read(0, super_block.data);
 
     if (inumber > super_block.super.ninodes || inumber <= 0)
@@ -447,276 +463,316 @@ int fs_getsize(int inumber)
 
 int fs_read(int inumber, char *data, int length, int offset)
 {
-    union fs_block super_block;
-    // allocate data array and add 1 char for null terminator
-    data = (char *)malloc((length) * sizeof(char));
-    data[0] = '\0';
-    // allocate temp data to copy data to main pointer
-    char *temp_data;
-
-    temp_data = (char *)malloc((DISK_BLOCK_SIZE + 1) * sizeof(char));
-    if (!temp_data)
-    {
-        free(data);
-        return 0;
-    }
-
-    if (!data)
+    // Check to see if a filesystem is mounted
+    if (!fs_mounted)
     {
         return 0;
     }
 
-    disk_read(0, super_block.data);
-
-    if (inumber > super_block.super.ninodes || inumber <= 0)
+    // Check to see if a valid inumber is passed
+    if (inumber <= 0)
     {
         return 0;
     }
 
-    if (offset < 0)
+    int pointer_count, is_direct_block, bytes_left, bytes_read = 0;
+
+    union fs_block block, indirect_block;
+    struct fs_inode inode;
+
+    char loop_data[4096] = "";
+    char total_data[16384] = "";
+
+    // Determine the inode offset as well as the inode block and pointer offset
+    int inode_offset = inumber % INODES_PER_BLOCK;
+    int block_index = inumber / INODES_PER_BLOCK + 1;
+    int pointer_offset = offset / 4096;
+
+    // Read from the inodes block
+    disk_read(block_index, block.data);
+    inode = block.inode[inode_offset];
+    int inode_size = inode.size;
+
+    // Check to make sure inode is valid and has a reasonable size
+    if ((!inode.isvalid) || !inode_size)
     {
         return 0;
     }
-    union fs_block inode_block;
-    union fs_block indirect_block;
 
-    // Read inode block
-    disk_read(((inumber / INODES_PER_BLOCK) + 1), inode_block.data);
-
-    int start_block = offset / DISK_BLOCK_SIZE;
-
-    // Check to see if indirect block will be used, if so read it in
-    if ((length + offset) / DISK_BLOCK_SIZE > POINTERS_PER_INODE)
+    // Determine how many bytes can/need to be read
+    if ((inode_size - offset) < length)
     {
-        if (inode_block.inode->indirect == 0)
+        bytes_left = inode_size - offset;
+    }
+    else
+    {
+        bytes_left = length;
+    }
+
+    // Traverse through each direct pointer in the inode
+    for (int i = pointer_offset; i < POINTERS_PER_INODE; i++)
+    {
+        is_direct_block = inode.direct[i];
+
+        // If direct block exists, read a piece of data and copy it. Recalculate how much has been read
+        if (is_direct_block)
         {
-            return 0;
-        }
+            disk_read(is_direct_block, *(&loop_data));
+            strcat(*(&total_data), *(&loop_data));
 
-        disk_read(inode_block.inode->indirect, indirect_block.data);
-    }
-
-    int bytes_read = 0;
-
-    for (int i = start_block; bytes_read < length; i++)
-    {
-        // Determine which block to read from
-        int curr_block;
-        if (i < POINTERS_PER_INODE)
-        {
-            curr_block = inode_block.inode[inumber % INODES_PER_BLOCK].direct[i];
-        }
-        else
-        {
-            // if there are no more indrect blocks to read, return number of
-            if (i - POINTERS_PER_BLOCK >= 1024)
+            if ((bytes_left - bytes_read) < 4096)
             {
+                bytes_read += bytes_left - bytes_read;
+            }
+            else
+            {
+                bytes_read += 4096;
+            }
+
+            if (bytes_read >= bytes_left)
+            {
+                strcpy(data, total_data);
                 return bytes_read;
             }
-            curr_block = indirect_block.pointers[i - POINTERS_PER_BLOCK];
         }
+    }
 
-        union fs_block read_block;
-        // grab block
-        disk_read(curr_block, read_block.data);
-        int read_offset = 0;
-        int read_length;
+    // Traverse through each indirect pointer in the inode if it exists
+    if (inode.indirect)
+    {
+        disk_read(inode.indirect, indirect_block.data);
 
-        if (curr_block == 0)
+        if (pointer_offset < 5)
         {
-            return bytes_read;
-        }
-        // if at beginning of file, start at offset, read until the end of the block
-        if (bytes_read == 0)
-        {
-            read_offset = offset % DISK_BLOCK_SIZE;
-            if (DISK_BLOCK_SIZE - offset > length)
-            {
-                read_length = length;
-            }
-            else
-            {
-                read_length = DISK_BLOCK_SIZE - offset;
-            }
-
-            // copy file contents to string
-            for (int j = 0; j < read_length; j++)
-            {
-                temp_data[j] = read_block.data[j + read_offset];
-            }
-
-            // update number of bytes read
-            temp_data[read_length] = '\0';
-            bytes_read += read_length;
-            strcat(data, temp_data);
+            pointer_count = 0;
         }
         else
         {
-            // if the block is not the first block and in last block, read what is left else read the entire block
+            pointer_count = pointer_offset - 5;
+        }
 
-            if ((length - bytes_read) < DISK_BLOCK_SIZE || (bytes_read + DISK_BLOCK_SIZE == length))
+        // Start looking from pointer offset
+        for (int j = pointer_count; j < POINTERS_PER_BLOCK; j++)
+        {
+            if (indirect_block.pointers[j])
             {
-                read_length = length - bytes_read;
+                disk_read(indirect_block.pointers[j], *(&loop_data));
+                strcat(*(&total_data), *(&loop_data));
 
-                // copy file contents to string
-                for (int j = 0; j < read_length; j++)
+                if ((bytes_left - bytes_read) < 4096)
                 {
-                    data[length - read_length - 1] = read_block.data[j];
+                    bytes_read += bytes_left - bytes_read;
+                }
+                else
+                {
+                    bytes_read += 4096;
                 }
 
-                bytes_read += read_length;
-            }
-            else
-            {
-                read_length = DISK_BLOCK_SIZE;
-
-                // copy file contents to string
-                for (int j = 0; j < read_length; j++)
+                if (bytes_read >= bytes_left)
                 {
-                    temp_data[j] = read_block.data[j];
+                    strcpy(data, total_data);
+                    return bytes_read;
                 }
-
-                temp_data[read_length] = '\0';
-                bytes_read += read_length;
-
-                strcat(data, temp_data);
             }
         }
     }
+
     return bytes_read;
 }
 
 int fs_write(int inumber, const char *data, int length, int offset)
 {
-
-    union fs_block super_block;
-    // allocate data array and add 1 char for null terminator
-    data = (char *)malloc((length) * sizeof(char));
-
-    if (!data)
+    // Check to see if a filesystem is mounted
+    if (!fs_mounted)
     {
         return 0;
     }
-    // allocate temp data to copy data to main pointer
-    char *temp_data;
 
-    temp_data = (char *)malloc((DISK_BLOCK_SIZE + 1) * sizeof(char));
-    if (!temp_data)
+    // Check to see if a valid inumber is passed
+    if (inumber <= 0)
     {
         return 0;
     }
+
+    int pointer_count, new_block, bytes_left, bytes_written = 0;
+    union fs_block block, indirect_block, super_block;
+
+    char total_data[16384] = "";
+    strcpy(total_data, data);
+
     disk_read(0, super_block.data);
 
-    if (inumber > super_block.super.ninodes || inumber <= 0)
+    // Determine the inode offset as well as the inode block and pointer offset
+    int inode_offset = inumber % INODES_PER_BLOCK;
+    int block_index = inumber / INODES_PER_BLOCK + 1;
+    int pointer_offset = offset / 4096;
+
+    // Read from the inodes block
+    disk_read(block_index, block.data);
+
+    int inode_size = (POINTERS_PER_INODE + POINTERS_PER_BLOCK) * 4096;
+
+    // Determine how many bytes can/need to be written
+    if ((inode_size - offset) < length)
+    {
+        bytes_left = inode_size - offset;
+    }
+    else
+    {
+        bytes_left = length;
+    }
+
+    // Check if inode is valid
+    if (!block.inode[inode_offset].isvalid)
     {
         return 0;
     }
 
-    if (offset < 0)
+    // If the offset is 0 at the start, reset direct and indirect pointers to 0
+    if (offset == 0)
     {
-        return 0;
-    }
-    union fs_block inode_block;
-    union fs_block indirect_block;
-
-    int start_block = offset / DISK_BLOCK_SIZE;
-
-    // Check to see if indirect block will be used, if so read it in
-    if ((length + offset) / DISK_BLOCK_SIZE > POINTERS_PER_INODE)
-    {
-        if (inode_block.inode->indirect == 0)
+        //Iterate through pointers of direct block
+        for (int x = 0; x < POINTERS_PER_INODE; x++)
         {
-            return 0;
+            if (block.inode[inode_offset].direct[x] <= 0)
+            {
+                continue;
+            }
+
+            bitmap[block.inode[inode_offset].direct[x]] = 0;
+            block.inode[inode_offset].direct[x] = 0;
         }
 
-        disk_read(inode_block.inode->indirect, indirect_block.data);
+        if (block.inode[inode_offset].indirect > 0)
+        {
+            union fs_block indirect_block;
+            disk_read(block.inode[inode_offset].indirect, indirect_block.data);
+
+            // Iterate through pointers of indirect block
+            for (int y = 0; y < POINTERS_PER_BLOCK; y++)
+            {
+                if (indirect_block.pointers[y] <= 0)
+                {
+                    continue;
+                }
+
+                bitmap[indirect_block.pointers[y]] = 0;
+                indirect_block.pointers[y] = 0;
+            }
+
+            disk_write(block.inode[inode_offset].indirect, indirect_block.data);
+
+            bitmap[block.inode[inode_offset].indirect] = 0;
+            block.inode[inode_offset].indirect = 0;
+        }
+
+        disk_write(block_index, block.data);
     }
 
-    int bytes_written = 0;
-
-    for (int i = start_block; bytes_written < length; i++)
+    // Traverse through each direct pointer in the inode
+    for (int i = pointer_offset; i < POINTERS_PER_INODE; i++)
     {
+        new_block = allocate_new_block(super_block.super.nblocks);
 
-        int curr_block;
-        if (i < POINTERS_PER_INODE)
+        // If the disk is full, there are no more blocks left
+        if (!new_block)
         {
-            curr_block = inode_block.inode[inumber % INODES_PER_BLOCK].direct[i];
+            block.inode[inode_offset].size = offset + bytes_written;
+            disk_write(block_index, block.data);
 
-            if (!curr_block)
-            {
-                curr_block = allocate_direct_block();
-                inode_block.inode[inumber % INODES_PER_BLOCK].direct[i] = curr_block;
-            }
+            return bytes_written;
+        }
+
+        block.inode[inode_offset].direct[i] = new_block;
+        disk_write(block.inode[inode_offset].direct[i], total_data);
+
+        // Write a piece of data and copy it. Recalculate how much has been read
+        if ((bytes_left - bytes_written) < 4096)
+        {
+            bytes_written += bytes_left - bytes_written;
         }
         else
         {
-            // if there are no more indrect blocks to write, return number of bytes written
-            if (i - POINTERS_PER_BLOCK >= 1024)
-            {
-                return bytes_written;
-            }
-            curr_block = indirect_block.pointers[i - POINTERS_PER_BLOCK];
-
-            // if block needs to be allocated, allocate it
-            if (!curr_block)
-            {
-                curr_block = allocate_direct_block();
-                indirect_block.pointers[i - POINTERS_PER_BLOCK] = curr_block;
-            }
+            bytes_written += 4096;
         }
 
-        int write_offset;
-        int write_length;
-        // if at beginning of file, start at offset, read until the end of the block
-        if (bytes_written == 0)
+        strcpy(total_data, &data[bytes_written]);
+
+        // Check to see if too many bytes were written
+        if (bytes_written >= bytes_left)
         {
-            write_offset = offset % DISK_BLOCK_SIZE;
-            if (DISK_BLOCK_SIZE - offset > length)
-            {
-                write_length = length;
-            }
-            else
-            {
-                write_length = DISK_BLOCK_SIZE - offset;
-            }
+            block.inode[inode_offset].size = offset + bytes_written;
+            disk_write(block_index, block.data);
 
-            for (int j = 0; j < write_length; j++)
-            {
-                temp_data[j] = data[j + write_offset];
-            }
-            // update number of bytes read
-            bytes_written += write_length;
+            return bytes_written;
+        }
+    }
 
-            disk_write(curr_block, temp_data);
+    // Check if you need to create an indirect block
+    if (!block.inode[inode_offset].indirect)
+    {
+        block.inode[inode_offset].indirect = allocate_new_block(super_block.super.nblocks);
+        disk_write(block.inode[inode_offset].indirect, indirect_block.data);
+    }
+
+    // Traverse through all the pointers in the indirect block
+    if (pointer_offset < 5)
+    {
+        pointer_count = 0;
+    }
+    else
+    {
+        pointer_count = pointer_offset - 5;
+    }
+
+    for (int j = pointer_count; j < POINTERS_PER_BLOCK; j++)
+    {
+        new_block = allocate_new_block(super_block.super.nblocks);
+
+        // If the disk is full, there are no more blocks left
+        if (!new_block)
+        {
+            block.inode[inode_offset].size = offset + bytes_written;
+            disk_write(block.inode[inode_offset].indirect, indirect_block.data);
+
+            disk_write(block_index, block.data);
+
+            return bytes_written;
+        }
+
+        indirect_block.pointers[j] = new_block;
+        disk_write(indirect_block.pointers[j], total_data);
+
+        // Write a piece of data and copy it. Recalculate how much has been read
+        if ((bytes_left - bytes_written) < 4096)
+        {
+            bytes_written += bytes_left - bytes_written;
         }
         else
         {
-            // if the block is not the first block and in last block, read what is left else read the entire block
+            bytes_written += 4096;
+        }
 
-            if ((length - bytes_written) < DISK_BLOCK_SIZE || (bytes_written + DISK_BLOCK_SIZE == length))
+        strcpy(total_data, &data[bytes_written]);
+
+        // Check to see if too many bytes were written
+        if (bytes_written >= bytes_left)
+        {
+            block.inode[inode_offset].size = offset + bytes_written;
+            disk_write(block.inode[inode_offset].indirect, indirect_block.data);
+
+            disk_write(block_index, block.data);
+
+            // Iterate through pointers of indirect block
+            for (int i = 0; i < POINTERS_PER_BLOCK; i++)
             {
-                write_length = length - bytes_written;
-
-                // copy file contents to string
-                for (int j = 0; j < write_length; j++)
+                if (indirect_block.pointers[i] <= 0)
                 {
-                    temp_data[j] = data[bytes_written + j];
+                    continue;
                 }
-
-                bytes_written += write_length;
             }
-            else
-            {
-                write_length = DISK_BLOCK_SIZE;
 
-                // copy file contents to string
-                for (int j = 0; j < write_length; j++)
-                {
-                    temp_data[j] = data[bytes_written + j];
-                }
-
-                bytes_written += write_length;
-            }
+            return bytes_written;
         }
     }
 
